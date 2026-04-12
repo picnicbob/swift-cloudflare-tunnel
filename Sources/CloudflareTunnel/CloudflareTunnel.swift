@@ -501,7 +501,12 @@ public actor CloudflareTunnel {
         var components = URLComponents(url: originURL, resolvingAgainstBaseURL: false)
 
         let destParts = request.dest.split(separator: "?", maxSplits: 1)
-        components?.path = String(destParts[0])
+        let requestPath = String(destParts[0])
+        // Append request path to origin base path (not replace)
+        let basePath = components?.path ?? ""
+        let trimmedBase = basePath.hasSuffix("/") ? String(basePath.dropLast()) : basePath
+        let trimmedRequest = requestPath.hasPrefix("/") ? requestPath : "/\(requestPath)"
+        components?.path = trimmedBase + trimmedRequest
         if destParts.count > 1 {
             components?.query = String(destParts[1])
         }

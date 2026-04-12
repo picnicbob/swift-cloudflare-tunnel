@@ -76,28 +76,39 @@ public actor TunnelConnection {
         reconnectTask?.cancel()
         reconnectTask = nil
 
-        // Send UnregisterConnection if control stream is alive
-        if let stream = controlStream {
+        // Send UnregisterConnection on a fresh stream to avoid conflicting
+        // with the monitor's outstanding receive on the control stream.
+        if let group = connectionGroup {
             do {
-                let unregisterMsg = TunnelRPCBuilder.buildUnregisterConnection(questionId: 2)
-                try await sendData(unregisterMsg, on: stream)
-
-                // Read return with 2s timeout
-                _ = try await withThrowingTaskGroup(of: Data?.self) { group in
-                    group.addTask {
-                        try await self.receiveCapnProtoMessage(on: stream)
+                guard let unregStream = NWConnection(from: group) else {
+                    throw TunnelConnectionError.connectionFailed("Failed to create unregister stream")
+                }
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    unregStream.stateUpdateHandler = { [weak unregStream] state in
+                        switch state {
+                        case .ready:
+                            unregStream?.stateUpdateHandler = nil
+                            continuation.resume()
+                        case .failed(let error):
+                            unregStream?.stateUpdateHandler = nil
+                            continuation.resume(throwing: error)
+                        default:
+                            break
+                        }
                     }
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: 2_000_000_000)
-                        return nil
-                    }
-                    let first = try await group.next()
-                    group.cancelAll()
-                    return first
+                    unregStream.start(queue: queue)
                 }
 
+                let signature = Data(CloudflareRPC.rpcStreamSignature)
+                try await sendData(signature, on: unregStream)
+
+                let unregisterMsg = TunnelRPCBuilder.buildUnregisterConnection(questionId: 2)
+                try await sendData(unregisterMsg, on: unregStream)
+
                 let finishMsg = TunnelRPCBuilder.buildFinish(questionId: 2)
-                try await sendData(finishMsg, on: stream)
+                try await sendData(finishMsg, on: unregStream)
+
+                unregStream.cancel()
             } catch {
                 logger.warning("Failed to send UnregisterConnection: \(error)")
             }
@@ -415,33 +426,41 @@ public actor TunnelConnection {
         // Send initial response headers
         try await sendResponse(session.initialResponse, on: stream)
 
-        // Bidirectional relay
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            // Inbound: QUIC stream -> handler (client -> origin)
-            group.addTask {
-                while true {
-                    let (data, isComplete) = try await self.receiveChunk(on: stream, minLength: 1, maxLength: 65536)
-                    if let data, !data.isEmpty {
-                        await session.handleData(data)
-                    }
-                    if isComplete {
-                        await session.handleClose()
-                        return
+        // Bidirectional relay with cleanup on cancellation
+        defer { session.close() }
+
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                // Inbound: QUIC stream -> handler (client -> origin)
+                group.addTask {
+                    defer { session.close() }
+                    while !Task.isCancelled {
+                        let (data, isComplete) = try await self.receiveChunk(on: stream, minLength: 1, maxLength: 65536)
+                        if let data, !data.isEmpty {
+                            await session.handleData(data)
+                        }
+                        if isComplete {
+                            await session.handleClose()
+                            return
+                        }
                     }
                 }
-            }
 
-            // Outbound: handler -> QUIC stream (origin -> client)
-            group.addTask {
-                for await data in session.outbound {
-                    try await self.sendData(data, on: stream)
+                // Outbound: handler -> QUIC stream (origin -> client)
+                group.addTask {
+                    for await data in session.outbound {
+                        try await self.sendData(data, on: stream)
+                    }
+                    stream.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
                 }
-                stream.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
-            }
 
-            // Wait for either direction to complete, then cancel the other
-            try await group.next()
-            group.cancelAll()
+                // Wait for either direction to complete, then cancel the other
+                try await group.next()
+                group.cancelAll()
+            }
+        } catch {
+            session.close()
+            throw error
         }
     }
 
