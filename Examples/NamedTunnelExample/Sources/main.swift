@@ -6,11 +6,15 @@ import Foundation
 // Creates a persistent tunnel with a custom domain.
 // Requires a Cloudflare API token and a domain managed by Cloudflare.
 //
-// Set environment variables:
+// Environment variables:
 //   CF_API_TOKEN  - Your Cloudflare API token
 //   CF_DOMAIN     - The domain to tunnel (e.g., "app.example.com")
+//   CF_ORIGIN     - (Optional) Local origin to proxy to (e.g., "http://localhost:3000")
+//   CF_CONNECTIONS - (Optional) Number of edge connections (default: 4)
 //
-// Run: CF_API_TOKEN=xxx CF_DOMAIN=app.example.com swift run NamedTunnelExample
+// Usage:
+//   CF_API_TOKEN=xxx CF_DOMAIN=app.example.com swift run NamedTunnelExample
+//   CF_API_TOKEN=xxx CF_DOMAIN=app.example.com CF_ORIGIN=http://localhost:3000 swift run NamedTunnelExample
 
 guard let apiToken = ProcessInfo.processInfo.environment["CF_API_TOKEN"] else {
     print("Error: Set CF_API_TOKEN environment variable")
@@ -24,21 +28,30 @@ guard let domain = ProcessInfo.processInfo.environment["CF_DOMAIN"] else {
     exit(1)
 }
 
-let tunnel = CloudflareTunnel()
+let originURL = ProcessInfo.processInfo.environment["CF_ORIGIN"]
+let connCount = ProcessInfo.processInfo.environment["CF_CONNECTIONS"].flatMap(UInt8.init) ?? 4
 
-// Handle incoming HTTP requests
-await tunnel.setRequestHandler { request, body in
-    print("[\(request.method)] \(request.host)\(request.dest)")
+let tunnel = CloudflareTunnel(connectionCount: connCount)
 
-    let json = """
-    {"message": "Hello from Swift!", "path": "\(request.dest)", "method": "\(request.method)"}
-    """
+if let originURL {
+    // Origin proxy mode: forward to a local HTTP server
+    try await tunnel.setOriginURL(originURL)
+    print("Proxying to \(originURL)")
+} else {
+    // In-process handler mode
+    await tunnel.setRequestHandler { request, body in
+        print("[\(request.method)] \(request.host)\(request.dest)")
 
-    return ProxyResponse(
-        statusCode: 200,
-        headers: [("Content-Type", "application/json")],
-        body: Data(json.utf8)
-    )
+        let json = """
+        {"message": "Hello from Swift!", "path": "\(request.dest)", "method": "\(request.method)"}
+        """
+
+        return ProxyResponse(
+            statusCode: 200,
+            headers: [("Content-Type", "application/json")],
+            body: Data(json.utf8)
+        )
+    }
 }
 
 // Observe state changes
@@ -55,7 +68,7 @@ await tunnel.setStateCallback { state in
 }
 
 // Set up the named tunnel
-print("Setting up named tunnel...")
+print("Setting up named tunnel with \(connCount) edge connections...")
 let config = try await tunnel.setup(apiToken: apiToken)
 print("Tunnel created: \(config.tunnelName ?? "unknown")")
 
@@ -70,13 +83,18 @@ try await tunnel.connect()
 print("")
 print("========================================")
 print("  Your site is live at: https://\(domain)")
+print("  Edge connections: \(connCount)")
 print("========================================")
 print("")
 print("Press Ctrl+C to stop.")
 
-// Keep running until interrupted
+// Graceful shutdown on Ctrl+C
+let shutdownTunnel = tunnel
 signal(SIGINT) { _ in
-    print("\nShutting down...")
-    exit(0)
+    print("\nShutting down gracefully...")
+    Task {
+        await shutdownTunnel.disconnect()
+        exit(0)
+    }
 }
 dispatchMain()

@@ -249,16 +249,63 @@ public actor CloudflareAPI {
 
     // MARK: - Edge Discovery
 
-    /// Discover Cloudflare edge IPs via DNS SRV lookup.
+    private static let srvName = "_v2-origintunneld._tcp.argotunnel.com"
+    private static let fallbackAddresses: [EdgeAddress] = [
+        EdgeAddress(host: "region1.v2.argotunnel.com", port: 7844),
+        EdgeAddress(host: "region2.v2.argotunnel.com", port: 7844),
+    ]
+
+    /// Discover Cloudflare edge servers via DNS SRV lookup with static fallback.
+    ///
+    /// Uses DNS-over-HTTPS to resolve SRV records for `_v2-origintunneld._tcp.argotunnel.com`.
+    /// Falls back to hardcoded region hostnames if the lookup fails.
     public func discoverEdgeIPs() async throws -> [EdgeAddress] {
-        // Fallback to known edge server regions.
-        // DNS SRV resolution (_v2-origintunneld._tcp.argotunnel.com) can be added later
-        // since the region hostnames resolve to the same edge IPs.
-        let fallbackAddresses: [EdgeAddress] = [
-            EdgeAddress(host: "region1.v2.argotunnel.com", port: 7844),
-            EdgeAddress(host: "region2.v2.argotunnel.com", port: 7844),
-        ]
-        return fallbackAddresses
+        do {
+            let srvResults = try await resolveSRV(name: Self.srvName)
+            if !srvResults.isEmpty {
+                return srvResults
+            }
+        } catch {
+            // SRV lookup failed; fall through to static addresses
+        }
+        return Self.fallbackAddresses
+    }
+
+    /// Resolve DNS SRV records using DNS-over-HTTPS (Google Public DNS).
+    private func resolveSRV(name: String) async throws -> [EdgeAddress] {
+        guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://dns.google/resolve?name=\(encoded)&type=SRV") else {
+            return []
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            return []
+        }
+
+        let dnsResponse = try JSONDecoder().decode(DoHResponse.self, from: data)
+        guard dnsResponse.Status == 0, let answers = dnsResponse.Answer else {
+            return []
+        }
+
+        var addresses: [EdgeAddress] = []
+        for answer in answers where answer.type == 33 { // SRV record type
+            // SRV data format: "priority weight port target"
+            let parts = answer.data.split(separator: " ")
+            guard parts.count >= 4,
+                  let port = UInt16(parts[2]) else { continue }
+            let target = String(parts[3]).trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            addresses.append(EdgeAddress(host: target, port: port))
+        }
+
+        // Sort by priority (lower = preferred), then shuffle within same priority
+        addresses.sort { a, _ in a.port == 7844 }
+        return addresses
     }
 
     // MARK: - Private Helpers
@@ -348,4 +395,15 @@ private struct ZoneListResponse: Decodable {
 
 private struct DNSListResponse: Decodable {
     let result: [DNSRecord]?
+}
+
+// DNS-over-HTTPS response (Google Public DNS JSON API)
+private struct DoHResponse: Decodable {
+    let Status: Int
+    let Answer: [DoHAnswer]?
+}
+
+private struct DoHAnswer: Decodable {
+    let type: Int
+    let data: String
 }

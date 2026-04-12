@@ -205,6 +205,76 @@ struct OriginProxyTests {
         let tunnel = CloudflareTunnel()
         try await tunnel.setOriginURL("http://localhost:8080")
     }
+
+    @Test("Origin proxy appends request path to base path")
+    func pathAppending() {
+        let origin = URL(string: "http://localhost:8080/app")!
+        let result = CloudflareTunnel.buildOriginURL(originURL: origin, dest: "/foo")
+        #expect(result?.path == "/app/foo")
+    }
+
+    @Test("Origin proxy preserves root origin path")
+    func rootOriginPath() {
+        let origin = URL(string: "http://localhost:8080")!
+        let result = CloudflareTunnel.buildOriginURL(originURL: origin, dest: "/api/users")
+        #expect(result?.path == "/api/users")
+    }
+
+    @Test("Origin proxy handles query strings")
+    func queryStringHandling() {
+        let origin = URL(string: "http://localhost:8080")!
+        let result = CloudflareTunnel.buildOriginURL(originURL: origin, dest: "/search?q=hello&page=2")
+        #expect(result?.path == "/search")
+        #expect(result?.query == "q=hello&page=2")
+    }
+
+    @Test("Origin proxy handles trailing slash on base path")
+    func trailingSlash() {
+        let origin = URL(string: "http://localhost:8080/app/")!
+        let result = CloudflareTunnel.buildOriginURL(originURL: origin, dest: "/foo")
+        #expect(result?.path == "/app/foo")
+    }
+}
+
+// MARK: - Domain Extraction Tests
+
+@Suite("DomainExtraction")
+struct DomainExtractionTests {
+
+    @Test("Simple domain passes through")
+    func simpleDomain() {
+        #expect(CloudflareTunnel.extractRootDomain("example.com") == "example.com")
+    }
+
+    @Test("Subdomain extracts root")
+    func subdomainExtraction() {
+        #expect(CloudflareTunnel.extractRootDomain("app.example.com") == "example.com")
+    }
+
+    @Test("Deep subdomain extracts root")
+    func deepSubdomain() {
+        #expect(CloudflareTunnel.extractRootDomain("a.b.c.example.com") == "example.com")
+    }
+
+    @Test("co.uk handled correctly")
+    func coUk() {
+        #expect(CloudflareTunnel.extractRootDomain("app.example.co.uk") == "example.co.uk")
+    }
+
+    @Test("com.au handled correctly")
+    func comAu() {
+        #expect(CloudflareTunnel.extractRootDomain("shop.example.com.au") == "example.com.au")
+    }
+
+    @Test("co.nz handled correctly")
+    func coNz() {
+        #expect(CloudflareTunnel.extractRootDomain("api.example.co.nz") == "example.co.nz")
+    }
+
+    @Test("Bare ccTLD domain passes through")
+    func bareCcTLD() {
+        #expect(CloudflareTunnel.extractRootDomain("example.co.uk") == "example.co.uk")
+    }
 }
 
 // MARK: - Test Helpers

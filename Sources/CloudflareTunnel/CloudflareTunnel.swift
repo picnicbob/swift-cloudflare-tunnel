@@ -207,7 +207,7 @@ public actor CloudflareTunnel {
             throw TunnelError.notConfigured
         }
 
-        let rootDomain = extractRootDomain(domain)
+        let rootDomain = Self.extractRootDomain(domain)
         let zones = try await api.listZones(apiToken: config.apiToken, name: rootDomain)
         guard let zone = zones.first else {
             throw CloudflareAPIError.apiError("Domain '\(rootDomain)' not found in your Cloudflare account. Make sure it's added to Cloudflare.")
@@ -493,16 +493,12 @@ public actor CloudflareTunnel {
         }
     }
 
-    private static func proxyToOrigin(
-        request: IncomingRequest,
-        body: Data?,
-        originURL: URL
-    ) async -> ProxyResponse {
+    /// Build the target URL by appending the request path to the origin base path.
+    static func buildOriginURL(originURL: URL, dest: String) -> URL? {
         var components = URLComponents(url: originURL, resolvingAgainstBaseURL: false)
 
-        let destParts = request.dest.split(separator: "?", maxSplits: 1)
+        let destParts = dest.split(separator: "?", maxSplits: 1)
         let requestPath = String(destParts[0])
-        // Append request path to origin base path (not replace)
         let basePath = components?.path ?? ""
         let trimmedBase = basePath.hasSuffix("/") ? String(basePath.dropLast()) : basePath
         let trimmedRequest = requestPath.hasPrefix("/") ? requestPath : "/\(requestPath)"
@@ -511,7 +507,15 @@ public actor CloudflareTunnel {
             components?.query = String(destParts[1])
         }
 
-        guard let targetURL = components?.url else {
+        return components?.url
+    }
+
+    private static func proxyToOrigin(
+        request: IncomingRequest,
+        body: Data?,
+        originURL: URL
+    ) async -> ProxyResponse {
+        guard let targetURL = buildOriginURL(originURL: originURL, dest: request.dest) else {
             return ProxyResponse.error("Failed to construct origin URL for \(request.dest)")
         }
 
@@ -573,12 +577,53 @@ public actor CloudflareTunnel {
         )
     }
 
-    /// Extract the root domain (e.g., "sub.example.com" -> "example.com").
-    private func extractRootDomain(_ domain: String) -> String {
-        let parts = domain.split(separator: ".")
-        if parts.count > 2 {
-            return parts.suffix(2).joined(separator: ".")
+    // Common two-part TLDs (country-code second-level domains).
+    // Not exhaustive, but covers the most common cases.
+    private static let twoPartTLDs: Set<String> = [
+        "co.uk", "org.uk", "me.uk", "net.uk", "ac.uk",
+        "com.au", "net.au", "org.au", "edu.au",
+        "co.nz", "net.nz", "org.nz",
+        "co.za", "org.za", "web.za",
+        "com.br", "net.br", "org.br",
+        "co.in", "net.in", "org.in",
+        "co.jp", "or.jp", "ne.jp",
+        "co.kr", "or.kr", "ne.kr",
+        "com.cn", "net.cn", "org.cn",
+        "com.tw", "org.tw", "net.tw",
+        "com.hk", "org.hk", "net.hk",
+        "com.sg", "org.sg", "net.sg",
+        "com.my", "org.my", "net.my",
+        "co.id", "or.id", "web.id",
+        "co.th", "or.th", "in.th",
+        "com.mx", "org.mx", "net.mx",
+        "com.ar", "org.ar", "net.ar",
+        "co.il", "org.il", "net.il",
+        "com.tr", "org.tr", "net.tr",
+        "co.ke", "or.ke", "ne.ke",
+        "com.ng", "org.ng", "net.ng",
+        "com.eg", "org.eg", "net.eg",
+        "co.za", "org.za",
+        "com.pl", "org.pl", "net.pl",
+        "com.ua", "org.ua", "net.ua",
+        "com.ph", "org.ph", "net.ph",
+    ]
+
+    /// Extract the root domain, handling common two-part TLDs.
+    /// "sub.example.com" -> "example.com"
+    /// "app.example.co.uk" -> "example.co.uk"
+    static func extractRootDomain(_ domain: String) -> String {
+        let parts = domain.split(separator: ".").map(String.init)
+        guard parts.count > 2 else { return domain }
+
+        // Check if the last two parts form a known two-part TLD
+        let lastTwo = parts.suffix(2).joined(separator: ".")
+        if twoPartTLDs.contains(lastTwo) {
+            // "example.co.uk" (3 parts) is already the root; return as-is
+            // "app.example.co.uk" (4+ parts) -> take last 3
+            if parts.count <= 3 { return domain }
+            return parts.suffix(3).joined(separator: ".")
         }
-        return domain
+
+        return parts.suffix(2).joined(separator: ".")
     }
 }
