@@ -293,19 +293,26 @@ public actor CloudflareAPI {
             return []
         }
 
-        var addresses: [EdgeAddress] = []
+        var addresses: [(priority: UInt16, weight: UInt16, address: EdgeAddress)] = []
         for answer in answers where answer.type == 33 { // SRV record type
             // SRV data format: "priority weight port target"
             let parts = answer.data.split(separator: " ")
             guard parts.count >= 4,
+                  let priority = UInt16(parts[0]),
+                  let weight = UInt16(parts[1]),
                   let port = UInt16(parts[2]) else { continue }
-            let target = String(parts[3]).trimmingCharacters(in: CharacterSet(charactersIn: "."))
-            addresses.append(EdgeAddress(host: target, port: port))
+            // Strip only the trailing dot from FQDN (e.g., "region1.v2.argotunnel.com." -> "region1.v2.argotunnel.com")
+            var target = String(parts[3])
+            if target.hasSuffix(".") { target = String(target.dropLast()) }
+            addresses.append((priority: priority, weight: weight, address: EdgeAddress(host: target, port: port)))
         }
 
-        // Sort by priority (lower = preferred), then shuffle within same priority
-        addresses.sort { a, _ in a.port == 7844 }
-        return addresses
+        // Sort by SRV priority (lower = preferred), then by weight (higher = preferred)
+        addresses.sort { a, b in
+            if a.priority != b.priority { return a.priority < b.priority }
+            return a.weight > b.weight
+        }
+        return addresses.map(\.address)
     }
 
     // MARK: - Private Helpers

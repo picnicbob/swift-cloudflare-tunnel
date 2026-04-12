@@ -602,7 +602,6 @@ public actor CloudflareTunnel {
         "co.ke", "or.ke", "ne.ke",
         "com.ng", "org.ng", "net.ng",
         "com.eg", "org.eg", "net.eg",
-        "co.za", "org.za",
         "com.pl", "org.pl", "net.pl",
         "com.ua", "org.ua", "net.ua",
         "com.ph", "org.ph", "net.ph",
