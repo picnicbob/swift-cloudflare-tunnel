@@ -23,26 +23,38 @@ import os
 /// ```
 public actor CloudflareTunnel {
     private var domains: [String: DomainStatus] = [:]
-    private var connection: TunnelConnection?
+    private var connections: [UInt8: TunnelConnection] = [:]
+    private var connectionStates: [UInt8: ConnectionState] = [:]
     private var tunnelConfig: TunnelConfiguration?
     private var quickTunnelCredentials: TunnelCredentials?
     private let api = CloudflareAPI()
     private var healthCheckTask: Task<Void, Never>?
     private var requestHandler: (@Sendable (IncomingRequest, Data?) async -> ProxyResponse)?
+    private var streamHandler: (@Sendable (IncomingRequest) async -> StreamSession)?
     private var stateCallback: (@Sendable (ConnectionState) -> Void)?
+    private var originURL: URL?
     private let logger: TunnelLogger
 
+    /// Number of redundant edge connections (matches cloudflared default).
+    public nonisolated let connectionCount: UInt8
+
     /// Prefix for auto-generated tunnel names. Only used with named tunnels.
-    public let tunnelNamePrefix: String
+    public nonisolated let tunnelNamePrefix: String
 
     /// Create a new CloudflareTunnel instance.
     ///
     /// - Parameters:
     ///   - logger: Logger implementation. Defaults to `OSLogTunnelLogger`.
     ///   - tunnelNamePrefix: Prefix for auto-generated tunnel names. Defaults to "swift-tunnel".
-    public init(logger: TunnelLogger = OSLogTunnelLogger(), tunnelNamePrefix: String = "swift-tunnel") {
+    ///   - connectionCount: Number of edge connections for redundancy. Defaults to 4.
+    public init(
+        logger: TunnelLogger = OSLogTunnelLogger(),
+        tunnelNamePrefix: String = "swift-tunnel",
+        connectionCount: UInt8 = 4
+    ) {
         self.logger = logger
         self.tunnelNamePrefix = tunnelNamePrefix
+        self.connectionCount = connectionCount
     }
 
     // MARK: - Configuration
@@ -60,6 +72,36 @@ public actor CloudflareTunnel {
         _ handler: @escaping @Sendable (IncomingRequest, Data?) async -> ProxyResponse
     ) {
         self.requestHandler = handler
+    }
+
+    /// Set handler for bidirectional streaming connections (WebSocket/TCP).
+    ///
+    /// When a WebSocket or TCP connection arrives, this handler is called to create
+    /// a ``StreamSession`` that manages the bidirectional data relay.
+    /// If not set, WebSocket/TCP requests fall through to the regular request handler.
+    public func setStreamHandler(
+        _ handler: @escaping @Sendable (IncomingRequest) async -> StreamSession
+    ) {
+        self.streamHandler = handler
+    }
+
+    /// Set a local origin server URL for automatic request forwarding.
+    ///
+    /// When set and no custom request handler is configured, incoming requests are
+    /// automatically forwarded to this URL via URLSession. This mimics standard
+    /// cloudflared behavior.
+    ///
+    /// Per-domain routing is supported via ``DomainMapping/serviceURL``.
+    /// Custom `requestHandler` takes priority if both are set.
+    public func setOriginURL(_ url: String) throws {
+        guard let parsed = URL(string: url) else {
+            throw TunnelError.connectionFailed("Invalid origin URL: \(url)")
+        }
+        self.originURL = parsed
+
+        if requestHandler == nil {
+            installOriginProxyHandler()
+        }
     }
 
     /// Set callback for connection state changes.
@@ -95,21 +137,7 @@ public actor CloudflareTunnel {
         info.publicURL = "https://\(hostname)"
         domains[hostname] = info
 
-        let conn = try TunnelConnection(logger: logger)
-        self.connection = conn
-
-        await conn.setStateCallback { [weak self] state in
-            guard let self else { return }
-            Task {
-                await self.handleConnectionState(state, domain: hostname)
-            }
-        }
-
-        if let handler = requestHandler {
-            await conn.setRequestHandler(handler)
-        }
-
-        try await conn.connect(credentials: credentials)
+        try await createConnections(credentials: credentials, domainKeys: [hostname])
 
         domains[hostname]?.connectionStatus = .connected
         domains[hostname]?.connectedSince = Date()
@@ -208,9 +236,14 @@ public actor CloudflareTunnel {
         try await syncIngressRules()
 
         var info = DomainStatus(domain: domain, routeIdentifier: routeIdentifier)
-        info.connectionStatus = connection != nil ? .connected : .disconnected
+        info.connectionStatus = !connections.isEmpty ? .connected : .disconnected
         info.publicURL = "https://\(domain)"
         domains[domain] = info
+
+        // Re-install origin proxy handler if active (captures updated mappings)
+        if originURL != nil && requestHandler != nil {
+            installOriginProxyHandler()
+        }
 
         logger.info("Domain added: \(domain) -> route \(routeIdentifier)")
     }
@@ -267,24 +300,8 @@ public actor CloudflareTunnel {
             tunnelID: uuid
         )
 
-        let conn = try TunnelConnection(logger: logger)
-        self.connection = conn
-
         let domainKeys = Array(config.domainMappings.keys)
-        await conn.setStateCallback { [weak self] state in
-            guard let self else { return }
-            Task {
-                for domain in domainKeys {
-                    await self.handleConnectionState(state, domain: domain)
-                }
-            }
-        }
-
-        if let handler = requestHandler {
-            await conn.setRequestHandler(handler)
-        }
-
-        try await conn.connect(credentials: credentials)
+        try await createConnections(credentials: credentials, domainKeys: domainKeys)
 
         for domain in domainKeys {
             domains[domain]?.connectionStatus = .connected
@@ -296,14 +313,17 @@ public actor CloudflareTunnel {
 
     // MARK: - Lifecycle
 
-    /// Disconnect a specific domain. If no domains remain, the connection is closed.
+    /// Disconnect a specific domain. If no domains remain, all connections are closed.
     public func disconnect(domain: String) async {
         domains[domain]?.connectionStatus = .disconnected
         domains.removeValue(forKey: domain)
 
         if domains.isEmpty {
-            await connection?.disconnect()
-            connection = nil
+            for conn in connections.values {
+                await conn.disconnect()
+            }
+            connections.removeAll()
+            connectionStates.removeAll()
             quickTunnelCredentials = nil
         }
 
@@ -314,8 +334,11 @@ public actor CloudflareTunnel {
     public func disconnect() async {
         healthCheckTask?.cancel()
         healthCheckTask = nil
-        await connection?.disconnect()
-        connection = nil
+        for conn in connections.values {
+            await conn.disconnect()
+        }
+        connections.removeAll()
+        connectionStates.removeAll()
         domains.removeAll()
         quickTunnelCredentials = nil
         logger.info("All tunnels stopped")
@@ -323,7 +346,7 @@ public actor CloudflareTunnel {
 
     /// Whether the tunnel connection is currently active.
     public func isConnected() async -> Bool {
-        if let conn = connection {
+        for conn in connections.values {
             let state = await conn.currentState()
             if case .connected = state { return true }
         }
@@ -370,32 +393,163 @@ public actor CloudflareTunnel {
         }
     }
 
-    // MARK: - Private
+    // MARK: - Multi-Connection Management
 
-    private func handleConnectionState(_ state: ConnectionState, domain: String) {
-        switch state {
-        case .connecting:
-            domains[domain]?.connectionStatus = .connecting
-        case .registering:
-            domains[domain]?.connectionStatus = .connecting
-        case .connected(let location):
-            domains[domain]?.connectionStatus = .connected
-            domains[domain]?.connectedSince = Date()
-            logger.info("[\(domain)] Connected at \(location)")
-        case .reconnecting(let attempt):
-            domains[domain]?.connectionStatus = .reconnecting
-            logger.info("[\(domain)] Reconnecting (attempt \(attempt))")
-        case .failed(let error):
-            domains[domain]?.connectionStatus = .error
-            domains[domain]?.lastError = error.localizedDescription
-            logger.error("[\(domain)] Failed: \(error)")
-        case .disconnected:
-            domains[domain]?.connectionStatus = .disconnected
+    private func createConnections(credentials: TunnelCredentials, domainKeys: [String]) async throws {
+        let edges = try await api.discoverEdgeIPs()
+        guard !edges.isEmpty else {
+            throw TunnelError.connectionFailed("No edge servers available")
         }
 
-        // Forward to external callback
-        stateCallback?(state)
+        var firstError: Error?
+
+        for i: UInt8 in 0..<connectionCount {
+            let edge = edges[Int(i) % edges.count]
+
+            do {
+                let conn = try TunnelConnection(connIndex: i, logger: logger)
+
+                let connIndex = i
+                await conn.setStateCallback { [weak self] state in
+                    guard let self else { return }
+                    Task {
+                        await self.handleSingleConnectionState(state, connIndex: connIndex, domainKeys: domainKeys)
+                    }
+                }
+
+                if let handler = requestHandler {
+                    await conn.setRequestHandler(handler)
+                }
+                if let sHandler = streamHandler {
+                    await conn.setStreamHandler(sHandler)
+                }
+
+                connections[i] = conn
+
+                try await conn.connect(credentials: credentials, edgeAddress: edge)
+                logger.info("Connection \(i) established to \(edge.host)")
+            } catch {
+                logger.warning("Connection \(i) to \(edge.host) failed: \(error)")
+                if firstError == nil { firstError = error }
+            }
+        }
+
+        // Fail only if ALL connections failed
+        if connections.isEmpty, let error = firstError {
+            throw error
+        }
     }
+
+    private func handleSingleConnectionState(_ state: ConnectionState, connIndex: UInt8, domainKeys: [String]) {
+        connectionStates[connIndex] = state
+
+        // Forward individual connection state
+        stateCallback?(state)
+
+        // Aggregate: domains are connected if ANY connection is up
+        let anyConnected = connectionStates.values.contains {
+            if case .connected = $0 { return true }
+            return false
+        }
+
+        let allFailed = !connectionStates.isEmpty && connectionStates.values.allSatisfy {
+            if case .failed = $0 { return true }
+            return false
+        }
+
+        for domain in domainKeys {
+            if anyConnected {
+                if domains[domain]?.connectionStatus != .connected {
+                    domains[domain]?.connectionStatus = .connected
+                    domains[domain]?.connectedSince = Date()
+                }
+            } else if allFailed {
+                domains[domain]?.connectionStatus = .error
+                if case .failed(let error) = state {
+                    domains[domain]?.lastError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    // MARK: - Origin HTTP Proxying
+
+    private func installOriginProxyHandler() {
+        let mappings = tunnelConfig?.domainMappings ?? [:]
+        let defaultURL = self.originURL
+
+        self.requestHandler = { request, body in
+            let origin: URL
+            if let mapping = mappings[request.host],
+               let url = URL(string: mapping.serviceURL) {
+                origin = url
+            } else if let defaultURL {
+                origin = defaultURL
+            } else {
+                return ProxyResponse.error("No origin configured for \(request.host)")
+            }
+
+            return await Self.proxyToOrigin(request: request, body: body, originURL: origin)
+        }
+    }
+
+    private static func proxyToOrigin(
+        request: IncomingRequest,
+        body: Data?,
+        originURL: URL
+    ) async -> ProxyResponse {
+        var components = URLComponents(url: originURL, resolvingAgainstBaseURL: false)
+
+        let destParts = request.dest.split(separator: "?", maxSplits: 1)
+        components?.path = String(destParts[0])
+        if destParts.count > 1 {
+            components?.query = String(destParts[1])
+        }
+
+        guard let targetURL = components?.url else {
+            return ProxyResponse.error("Failed to construct origin URL for \(request.dest)")
+        }
+
+        var urlRequest = URLRequest(url: targetURL)
+        urlRequest.httpMethod = request.method
+
+        let hopByHopHeaders: Set<String> = [
+            "connection", "keep-alive", "proxy-authenticate",
+            "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
+        ]
+        for (name, value) in request.headers {
+            if !hopByHopHeaders.contains(name.lowercased()) {
+                urlRequest.setValue(value, forHTTPHeaderField: name)
+            }
+        }
+
+        urlRequest.setValue(originURL.host, forHTTPHeaderField: "Host")
+        urlRequest.httpBody = body
+
+        do {
+            let (responseData, response) = try await URLSession.shared.data(for: urlRequest)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return ProxyResponse.error("Invalid response from origin")
+            }
+
+            var responseHeaders: [(String, String)] = []
+            for (key, value) in httpResponse.allHeaderFields {
+                if let name = key as? String, let val = value as? String {
+                    responseHeaders.append((name, val))
+                }
+            }
+
+            return ProxyResponse(
+                statusCode: httpResponse.statusCode,
+                headers: responseHeaders,
+                body: responseData
+            )
+        } catch {
+            return ProxyResponse.error("Origin request failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Private Helpers
 
     private func syncIngressRules() async throws {
         guard let config = tunnelConfig, let tunnelId = config.tunnelId else { return }

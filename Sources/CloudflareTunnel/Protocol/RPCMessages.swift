@@ -136,6 +136,44 @@ enum TunnelRPCBuilder {
         }
     }
 
+    /// Build an UnregisterConnection Call message.
+    /// Uses method 1 on the same registration interface with empty params.
+    static func buildUnregisterConnection(questionId: UInt32 = 2) -> Data {
+        var msg = CapnProtoMessage()
+
+        let rootPtr = msg.allocate(words: 1)
+
+        let msgData = msg.allocate(words: 3)
+        msg.setUInt16(CloudflareRPC.messageCall, wordIndex: msgData, byteOffset: 0)
+
+        let msgPtrStart = msg.allocate(words: 3)
+
+        let callData = msg.allocate(words: 3)
+        var callWord0: UInt64 = UInt64(questionId)
+        callWord0 |= UInt64(CloudflareRPC.unregisterConnectionMethod) << 32
+        callWord0 |= UInt64(0) << 48 // sendResultsTo = caller
+        msg.set(callWord0, at: callData)
+        msg.set(CloudflareRPC.registrationServerInterface, at: callData + 1)
+        msg.set(0, at: callData + 2)
+
+        let callPtrStart = msg.allocate(words: 3)
+
+        msg.setStructPointer(at: rootPtr, offset: 0, dataWords: 3, pointerWords: 3)
+        msg.setStructPointer(at: msgPtrStart, offset: Int32(callData - msgPtrStart - 1), dataWords: 3, pointerWords: 3)
+
+        // MessageTarget: importedCap = 0
+        let targetData = msg.allocate(words: 1)
+        msg.set(0, at: targetData)
+        let _ = msg.allocate(words: 1) // promisedAnswer pointer (null)
+        msg.setStructPointer(at: callPtrStart, offset: Int32(targetData - callPtrStart - 1), dataWords: 1, pointerWords: 1)
+
+        // Payload with empty params
+        let payloadPtrs = msg.allocate(words: 2)
+        msg.setStructPointer(at: callPtrStart + 1, offset: Int32(payloadPtrs - (callPtrStart + 1) - 1), dataWords: 0, pointerWords: 2)
+
+        return msg.serialize()
+    }
+
     /// Build a Finish message.
     static func buildFinish(questionId: UInt32) -> Data {
         var msg = CapnProtoMessage()

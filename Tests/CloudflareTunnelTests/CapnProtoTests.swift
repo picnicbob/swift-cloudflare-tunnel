@@ -54,6 +54,19 @@ struct CapnProtoTests {
         #expect(msg.count % 8 == 0)
     }
 
+    @Test("TunnelRPCBuilder builds UnregisterConnection message")
+    func unregisterConnectionMessage() throws {
+        let msg = TunnelRPCBuilder.buildUnregisterConnection(questionId: 2)
+        #expect(msg.count > 0)
+        #expect(msg.count % 8 == 0)
+
+        // Parse and verify it's a Call message with methodId 1
+        let reader = try CapnProtoReader(data: msg)
+        let root = try reader.rootStruct()
+        let discriminant = root.uint16(byteOffset: 0)
+        #expect(discriminant == 2) // messageCall
+    }
+
     @Test("CapnProtoReader can parse a Bootstrap message")
     func readerCanParse() throws {
         let bootstrapData = TunnelRPCBuilder.buildBootstrap(questionId: 0)

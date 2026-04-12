@@ -12,16 +12,20 @@ public actor TunnelConnection {
     private var controlStream: NWConnection?
     private let queue = DispatchQueue(label: "com.cloudflare.tunnel.connection", qos: .userInitiated)
     private var credentials: TunnelCredentials?
+    private var edgeAddress: EdgeAddress?
     private var state: ConnectionState = .disconnected
     private var stateCallback: (@Sendable (ConnectionState) -> Void)?
     private var requestHandler: (@Sendable (IncomingRequest, Data?) async -> ProxyResponse)?
+    private var streamHandler: (@Sendable (IncomingRequest) async -> StreamSession)?
     private var reconnectTask: Task<Void, Never>?
     private var activeStreams: Set<ObjectIdentifier> = []
     private let maxReconnectAttempts = 10
     private let clientId: Data
+    let connIndex: UInt8
     let logger: TunnelLogger
 
-    public init(logger: TunnelLogger) throws {
+    public init(connIndex: UInt8 = 0, logger: TunnelLogger) throws {
+        self.connIndex = connIndex
         self.logger = logger
         var bytes = [UInt8](repeating: 0, count: 16)
         guard SecRandomCopyBytes(kSecRandomDefault, 16, &bytes) == errSecSuccess else {
@@ -42,6 +46,11 @@ public actor TunnelConnection {
         self.requestHandler = handler
     }
 
+    /// Set handler for bidirectional streaming (WebSocket/TCP).
+    public func setStreamHandler(_ handler: @escaping @Sendable (IncomingRequest) async -> StreamSession) {
+        self.streamHandler = handler
+    }
+
     /// Connect to Cloudflare edge and register the tunnel.
     public func connect(credentials: TunnelCredentials) async throws {
         self.credentials = credentials
@@ -51,10 +60,49 @@ public actor TunnelConnection {
         try await connectToEdge()
     }
 
-    /// Disconnect the tunnel.
-    public func disconnect() {
+    /// Connect to a specific Cloudflare edge server.
+    public func connect(credentials: TunnelCredentials, edgeAddress: EdgeAddress) async throws {
+        self.credentials = credentials
+        self.edgeAddress = edgeAddress
         reconnectTask?.cancel()
         reconnectTask = nil
+
+        try await connectToEdge(edgeAddress: edgeAddress)
+    }
+
+    /// Disconnect the tunnel gracefully.
+    /// Sends UnregisterConnection RPC before closing the QUIC connection.
+    public func disconnect() async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+
+        // Send UnregisterConnection if control stream is alive
+        if let stream = controlStream {
+            do {
+                let unregisterMsg = TunnelRPCBuilder.buildUnregisterConnection(questionId: 2)
+                try await sendData(unregisterMsg, on: stream)
+
+                // Read return with 2s timeout
+                _ = try await withThrowingTaskGroup(of: Data?.self) { group in
+                    group.addTask {
+                        try await self.receiveCapnProtoMessage(on: stream)
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                        return nil
+                    }
+                    let first = try await group.next()
+                    group.cancelAll()
+                    return first
+                }
+
+                let finishMsg = TunnelRPCBuilder.buildFinish(questionId: 2)
+                try await sendData(finishMsg, on: stream)
+            } catch {
+                logger.warning("Failed to send UnregisterConnection: \(error)")
+            }
+        }
+
         controlStream?.cancel()
         controlStream = nil
         connectionGroup?.cancel()
@@ -73,14 +121,23 @@ public actor TunnelConnection {
 
     // MARK: - Connection Setup
 
-    private func connectToEdge() async throws {
+    private func connectToEdge(edgeAddress: EdgeAddress? = nil) async throws {
         updateState(.connecting)
 
-        let api = CloudflareAPI()
-        let edges = try await api.discoverEdgeIPs()
-        guard let edge = edges.first else {
-            throw TunnelConnectionError.noEdgeServers
+        let edge: EdgeAddress
+        if let provided = edgeAddress {
+            edge = provided
+        } else if let stored = self.edgeAddress {
+            edge = stored
+        } else {
+            let api = CloudflareAPI()
+            let edges = try await api.discoverEdgeIPs()
+            guard let first = edges.first else {
+                throw TunnelConnectionError.noEdgeServers
+            }
+            edge = first
         }
+        self.edgeAddress = edge
 
         let host = NWEndpoint.Host(edge.host)
         let port = NWEndpoint.Port(integerLiteral: edge.port)
@@ -210,7 +267,7 @@ public actor TunnelConnection {
         let registerMsg = TunnelRPCBuilder.buildRegisterConnection(
             questionId: 1,
             credentials: credentials,
-            connIndex: 0,
+            connIndex: connIndex,
             clientId: clientId,
             features: ["serialized_headers"],
             version: "2024.1.0",
@@ -321,46 +378,126 @@ public actor TunnelConnection {
             let request = try DataStreamBuilder.parseConnectRequest(data: fullMessage)
             logger.info("Tunnel request: \(request.method) \(request.host)\(request.dest)")
 
-            let body = try await readStreamBody(stream)
-
-            guard let handler = requestHandler else {
-                logger.warning("No request handler configured")
-                return
+            switch request.connectionType {
+            case .http:
+                try await handleHTTPStream(stream, request: request)
+            case .websocket, .tcp:
+                try await handleBidirectionalStream(stream, request: request)
             }
-
-            let response = await handler(request, body)
-
-            // Write response back
-            var responseData = Data(CloudflareRPC.dataStreamSignature)
-            responseData.append(contentsOf: CloudflareRPC.protocolVersion)
-
-            let responseHeaders = response.headers.map { ($0.0, $0.1) }
-            let connectResponse = DataStreamBuilder.buildConnectResponse(
-                status: response.statusCode,
-                headers: responseHeaders
-            )
-            responseData.append(connectResponse)
-
-            try await sendData(responseData, on: stream)
-
-            if !response.body.isEmpty {
-                try await sendData(response.body, on: stream)
-            }
-
-            stream.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
 
         } catch {
             logger.error("Data stream error: \(error)")
         }
     }
 
+    private func handleHTTPStream(_ stream: NWConnection, request: IncomingRequest) async throws {
+        let body = try await readStreamBody(stream)
+
+        guard let handler = requestHandler else {
+            logger.warning("No request handler configured")
+            return
+        }
+
+        let response = await handler(request, body)
+        try await sendResponse(response, on: stream)
+        stream.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
+    }
+
+    private func handleBidirectionalStream(_ stream: NWConnection, request: IncomingRequest) async throws {
+        // Fall back to one-shot HTTP handler if no stream handler is set
+        guard let handler = streamHandler else {
+            try await handleHTTPStream(stream, request: request)
+            return
+        }
+
+        let session = await handler(request)
+
+        // Send initial response headers
+        try await sendResponse(session.initialResponse, on: stream)
+
+        // Bidirectional relay
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            // Inbound: QUIC stream -> handler (client -> origin)
+            group.addTask {
+                while true {
+                    let (data, isComplete) = try await self.receiveChunk(on: stream, minLength: 1, maxLength: 65536)
+                    if let data, !data.isEmpty {
+                        await session.handleData(data)
+                    }
+                    if isComplete {
+                        await session.handleClose()
+                        return
+                    }
+                }
+            }
+
+            // Outbound: handler -> QUIC stream (origin -> client)
+            group.addTask {
+                for await data in session.outbound {
+                    try await self.sendData(data, on: stream)
+                }
+                stream.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
+            }
+
+            // Wait for either direction to complete, then cancel the other
+            try await group.next()
+            group.cancelAll()
+        }
+    }
+
+    private func sendResponse(_ response: ProxyResponse, on stream: NWConnection) async throws {
+        var responseData = Data(CloudflareRPC.dataStreamSignature)
+        responseData.append(contentsOf: CloudflareRPC.protocolVersion)
+
+        let connectResponse = DataStreamBuilder.buildConnectResponse(
+            status: response.statusCode,
+            headers: response.headers.map { ($0.0, $0.1) }
+        )
+        responseData.append(connectResponse)
+
+        try await sendData(responseData, on: stream)
+
+        if !response.body.isEmpty {
+            try await sendData(response.body, on: stream)
+        }
+    }
+
+    private static let maxBodySize = 10_485_760 // 10 MB
+
     private func readStreamBody(_ stream: NWConnection) async throws -> Data? {
-        return try await withCheckedThrowingContinuation { continuation in
-            stream.receive(minimumIncompleteLength: 0, maximumLength: 1_048_576) { data, _, _, error in
+        // First read with minimumIncompleteLength: 0 to handle no-body case without blocking
+        let (firstData, firstComplete) = try await receiveChunk(on: stream, minLength: 0, maxLength: 1_048_576)
+
+        guard let firstData, !firstData.isEmpty else {
+            return nil
+        }
+
+        var buffer = firstData
+        if firstComplete {
+            return buffer
+        }
+
+        // Loop until stream completes or max body size reached
+        while buffer.count < Self.maxBodySize {
+            let remaining = min(1_048_576, Self.maxBodySize - buffer.count)
+            let (data, isComplete) = try await receiveChunk(on: stream, minLength: 1, maxLength: remaining)
+            if let data, !data.isEmpty {
+                buffer.append(data)
+            }
+            if isComplete {
+                break
+            }
+        }
+        return buffer
+    }
+
+    private func receiveChunk(on connection: NWConnection, minLength: Int, maxLength: Int) async throws -> (Data?, Bool) {
+        try await withCheckedThrowingContinuation { continuation in
+            connection.receive(minimumIncompleteLength: minLength, maximumLength: maxLength) { data, _, isComplete, error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
-                    continuation.resume(returning: data)
+                    continuation.resume(returning: (data, isComplete))
                 }
             }
         }
