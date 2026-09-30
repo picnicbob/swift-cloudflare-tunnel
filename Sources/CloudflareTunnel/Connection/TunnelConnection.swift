@@ -98,10 +98,10 @@ public actor TunnelConnection {
                     }
                     unregStream.start(queue: queue)
                 }
-/* DON'T
+
                 let signature = Data(CloudflareRPC.rpcStreamSignature)
                 try await sendData(signature, on: unregStream)
-*/
+
                 let unregisterMsg = TunnelRPCBuilder.buildUnregisterConnection(questionId: 2)
                 try await sendData(unregisterMsg, on: unregStream)
 
@@ -265,11 +265,11 @@ public actor TunnelConnection {
             }
             stream.start(queue: queue)
         }
-/* DONT
+
         // Write RPC stream signature
         let signature = Data(CloudflareRPC.rpcStreamSignature)
         try await sendData(signature, on: stream)
-*/
+
         // Step 1: Send Bootstrap message
         let bootstrapMsg = TunnelRPCBuilder.buildBootstrap(questionId: 0)
         try await sendData(bootstrapMsg, on: stream)
