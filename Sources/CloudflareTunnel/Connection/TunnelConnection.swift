@@ -157,7 +157,7 @@ public actor TunnelConnection {
         // Configure QUIC with argotunnel ALPN
         let quicOptions = NWProtocolQUIC.Options(alpn: ["argotunnel"])
         quicOptions.direction = .bidirectional
-        quicOptions.idleTimeout = 5_000 // 5 seconds (matches cloudflared quic/constants.go)
+        quicOptions.idleTimeout = 30_000
 
         let securityOptions = quicOptions.securityProtocolOptions
         sec_protocol_options_set_tls_server_name(securityOptions, "quic.cftunnel.com")
