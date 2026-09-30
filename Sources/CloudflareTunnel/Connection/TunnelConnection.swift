@@ -575,7 +575,7 @@ public actor TunnelConnection {
 
     private func sendData(_ data: Data, on connection: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
+			connection.send(content: data, isComplete: false, completion: .contentProcessed { error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
