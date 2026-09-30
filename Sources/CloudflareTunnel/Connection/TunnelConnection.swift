@@ -161,7 +161,15 @@ public actor TunnelConnection {
 
         let securityOptions = quicOptions.securityProtocolOptions
         sec_protocol_options_set_tls_server_name(securityOptions, "quic.cftunnel.com")
-
+#if DEBUG
+		sec_protocol_options_set_verify_block(securityOptions, { [logger] _, secTrust, complete in
+			let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
+			var error: CFError?
+			let ok = SecTrustEvaluateWithError(trust, &error)
+			logger.warning("DEBUG: bypassing trust. system eval ok=\(ok), error=\(String(describing: error))")
+			complete(true)
+		}, queue)
+#endif
         let parameters = NWParameters(quic: quicOptions)
 
         let multiplexGroup = NWMultiplexGroup(to: endpoint)
