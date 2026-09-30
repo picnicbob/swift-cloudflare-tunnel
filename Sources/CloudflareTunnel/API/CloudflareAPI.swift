@@ -362,7 +362,7 @@ private struct QuickTunnelAPIResponse: Decodable {
         let name: String
         let hostname: String
         let accountTag: String
-        let secret: [UInt8]
+        let secret: Data
 
         enum CodingKeys: String, CodingKey {
             case id, name, hostname
