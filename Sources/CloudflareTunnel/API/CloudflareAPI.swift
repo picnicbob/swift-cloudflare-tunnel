@@ -79,7 +79,12 @@ public actor CloudflareAPI {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
-        let result: CFAPITunnelResult = try decodeResponse(data: data, response: response)
+		struct Response: Decodable {
+			let success: Bool
+			let result: CFAPITunnelResult
+		}
+        let cfResponse: Response = try decodeResponse(data: data, response: response)
+		let result: CFAPITunnelResult = cfResponse.result
 
         guard let tunnelID = UUID(uuidString: result.id) else {
             throw CloudflareAPIError.invalidResponse("Invalid tunnel ID")
