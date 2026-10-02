@@ -593,9 +593,9 @@ public actor TunnelConnection {
         }
     }
 
-    private func receiveData(on connection: NWConnection, minLength: Int) async throws -> Data {
+	private func receiveData(on connection: NWConnection, minLength: Int, maxLength: Int) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
-            connection.receive(minimumIncompleteLength: minLength, maximumLength: 1_048_576) { data, _, _, error in
+			connection.receive(minimumIncompleteLength: minLength, maximumLength: maxLength) { data, _, _, error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else if let data {
@@ -616,7 +616,7 @@ public actor TunnelConnection {
         var buffer = Data()
         while buffer.count < count {
             let remaining = count - buffer.count
-            let chunk = try await receiveData(on: connection, minLength: min(remaining, 1))
+			let chunk = try await receiveData(on: connection, minLength: min(remaining, 1), maxLength: remaining)
             guard !chunk.isEmpty else {
                 throw TunnelConnectionError.noData
             }
