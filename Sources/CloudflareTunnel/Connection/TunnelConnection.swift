@@ -259,7 +259,8 @@ public actor TunnelConnection {
 		self.controlStream = stream
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            stream.stateUpdateHandler = { [weak stream] state in
+            stream.stateUpdateHandler = { [weak stream, logger] state in
+				logger.info("Registration stream is \(state)")
                 switch state {
                 case .ready:
                     stream?.stateUpdateHandler = nil
@@ -279,8 +280,10 @@ public actor TunnelConnection {
         try await sendData(signature, on: stream)
 */
         // Step 1: Send Bootstrap message
+		logger.info("Sending bootstrap")
         let bootstrapMsg = TunnelRPCBuilder.buildBootstrap(questionId: 0)
         try await sendData(bootstrapMsg, on: stream)
+		logger.info("Sent bootstrap")
 
         // Step 2: Read Bootstrap return (proper Cap'n Proto framing)
         let bootstrapReturn = try await receiveCapnProtoMessage(on: stream)
@@ -289,6 +292,7 @@ public actor TunnelConnection {
         // Step 3: Send Finish for bootstrap
         let finishBootstrap = TunnelRPCBuilder.buildFinish(questionId: 0)
         try await sendData(finishBootstrap, on: stream)
+		logger.info("Finished bootstrap")
 
         // Step 4: Send RegisterConnection call
         let registerMsg = TunnelRPCBuilder.buildRegisterConnection(
@@ -323,11 +327,11 @@ public actor TunnelConnection {
             logger.error("Registration error: \(msg)")
             throw TunnelConnectionError.registrationFailed(msg)
         }
-
+		logger.info("Finishing registration")
         // Step 6: Send Finish for registration
         let finishRegister = TunnelRPCBuilder.buildFinish(questionId: 1)
         try await sendData(finishRegister, on: stream)
-
+		logger.info("Finished registration")
         // Keep control stream alive for the tunnel duration
         monitorControlStream(stream, logger: logger)
     }
@@ -616,7 +620,9 @@ public actor TunnelConnection {
         var buffer = Data()
         while buffer.count < count {
             let remaining = count - buffer.count
+			logger.info("Reading \(remaining) bytes")
 			let chunk = try await receiveData(on: connection, minLength: min(remaining, 1), maxLength: remaining)
+			logger.info("Received \(chunk.count) bytes")
             guard !chunk.isEmpty else {
                 throw TunnelConnectionError.noData
             }
@@ -629,9 +635,12 @@ public actor TunnelConnection {
     /// Reads the 8-byte segment table header, validates the segment size,
     /// then reads exactly the right number of bytes for the segment data.
     private func receiveCapnProtoMessage(on connection: NWConnection) async throws -> Data {
+		logger.info("Reading Cap'n Proto message")
         let segTable = try await receiveExactly(8, on: connection)
+		logger.info("Received segTable: \(segTable.count) bytes")
         let segCountMinusOne = segTable.withUnsafeBytes { $0.load(as: UInt32.self) }
         guard segCountMinusOne == 0 else {
+			logger.error("Multi-segment Cap'n Proto messages not supported")
             throw TunnelConnectionError.connectionFailed("Multi-segment Cap'n Proto messages not supported")
         }
         let segSize = segTable.withUnsafeBytes { $0.load(fromByteOffset: 4, as: UInt32.self) }
@@ -639,7 +648,9 @@ public actor TunnelConnection {
         guard segSize <= maxSegWords else {
             throw TunnelConnectionError.connectionFailed("Oversized Cap'n Proto segment: \(segSize) words")
         }
+		logger.info("Awaiting segData: \(segSize) words")
         let segData = try await receiveExactly(Int(segSize) * 8, on: connection)
+		logger.info("Received segData: \(segData.count) bytes")
         return segTable + segData
     }
 

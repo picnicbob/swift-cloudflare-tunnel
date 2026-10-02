@@ -10,6 +10,7 @@ let package = Package(
     ],
     products: [
         .library(name: "CloudflareTunnel", targets: ["CloudflareTunnel"]),
+		.executable(name: "Quick Tunnel Test", targets: ["qtt"])
     ],
     dependencies: [],
     targets: [
@@ -23,5 +24,6 @@ let package = Package(
             dependencies: ["CloudflareTunnel"],
             path: "Tests/CloudflareTunnelTests"
         ),
+		.executableTarget(name: "qtt", dependencies: ["CloudflareTunnel"])
     ]
 )
