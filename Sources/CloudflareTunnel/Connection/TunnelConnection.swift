@@ -172,22 +172,14 @@ public actor TunnelConnection {
 #endif
         let parameters = NWParameters(quic: quicOptions)
 
-        let multiplexGroup = NWMultiplexGroup(to: endpoint)
-        let group = NWConnectionGroup(with: multiplexGroup, using: parameters)
-
-        let groupRef = group
-        group.stateUpdateHandler = { [weak self] newState in
-            guard let self else { return }
-            Task { await self.handleGroupState(newState, group: groupRef) }
-        }
-
-        group.newConnectionHandler = { [weak self] stream in
-            guard let self else { return }
-            Task { await self.handleIncomingStream(stream) }
-        }
-
-        self.connectionGroup = group
-        group.start(queue: queue)
+		let conn = NWConnection(to: endpoint, using: parameters)
+		self.controlStream = conn
+		conn.stateUpdateHandler = { [weak self] state in
+			guard let self else { return }
+			Task { await self.handlePlainState(state) }
+		}
+		conn.start(queue: queue)
+		try await waitForConnection()
 
         try await waitForConnection()
     }
@@ -199,6 +191,25 @@ public actor TunnelConnection {
     }
 
     private var pendingConnectionContinuation: CheckedContinuation<Void, Error>?
+
+	private func handlePlainState(_ state: NWConnection.State) {
+		switch state {
+		case .ready:
+			if let c = pendingConnectionContinuation {
+				pendingConnectionContinuation = nil
+				Task {
+					do { try await performRegistration(); c.resume() }
+					catch { c.resume(throwing: error) }
+				}
+			}
+		case .failed(let error):
+			if let c = pendingConnectionContinuation {
+				pendingConnectionContinuation = nil
+				c.resume(throwing: TunnelConnectionError.connectionFailed(error.localizedDescription))
+			}
+		default: break
+		}
+	}
 
     private func handleGroupState(_ newState: NWConnectionGroup.State, group: NWConnectionGroup) {
         switch newState {
@@ -239,16 +250,13 @@ public actor TunnelConnection {
     // MARK: - Control Stream Registration
 
     private func performRegistration() async throws {
-        guard let group = connectionGroup, let credentials = credentials else {
-            throw TunnelConnectionError.notConfigured
-        }
+		guard let stream = controlStream, let credentials = credentials else {
+			throw TunnelConnectionError.notConfigured
+		}
 
         updateState(.registering)
 
-        guard let stream = NWConnection(from: group) else {
-            throw TunnelConnectionError.connectionFailed("Failed to create control stream")
-        }
-        self.controlStream = stream
+		self.controlStream = stream
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             stream.stateUpdateHandler = { [weak stream] state in
